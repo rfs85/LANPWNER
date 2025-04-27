@@ -1,0 +1,9 @@
+# Install all dependencies with: pip install -r requirements.txt
+scapy
+netifaces
+zeroconf
+requests
+lxml
+pyyaml
+asyncio
+colorama 

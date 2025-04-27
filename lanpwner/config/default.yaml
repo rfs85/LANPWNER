@@ -1,0 +1,12 @@
+# LANPWNER Default Configuration
+interface: null  # e.g., eth0
+logging:
+  level: INFO
+  file: lanpwner.log
+modules:
+  upnp: true
+  rtp: true
+  rtsp: true
+  multicast: true
+  apipa: true
+  bonjour: true 

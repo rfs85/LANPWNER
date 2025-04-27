@@ -1,0 +1,22 @@
+You are an expert security analyst and technical writer. Given the following JSON data of LAN protocol security findings, generate a comprehensive, professional, and visually appealing HTML report suitable for technical and executive audiences.
+
+Requirements:
+- Title and executive summary.
+- For each finding, include:
+  - Clear title and description.
+  - Protocol and device/service details.
+  - Enumerated vulnerabilities with:
+    - CVE IDs (if available),
+    - Severity (CVSS if available),
+    - Detailed description,
+    - Exploitation evidence (if any),
+    - Remediation steps (actionable, prioritized),
+    - References to related standards (e.g., RFCs, NIST, ISO),
+    - Links to CVE/NVD or vendor advisories.
+- Group findings by protocol and severity.
+- Include a summary table of all findings.
+- Use professional HTML/CSS for readability (tables, headings, sections).
+- End with a section on general LAN security best practices and references.
+
+Findings data:
+{{FINDINGS_JSON}} 
