@@ -10,6 +10,10 @@ import random
 import ipaddress
 import threading
 import time
+from lanpwner.protocols.snmp import SNMPModule
+from lanpwner.protocols.sip import SIPModule
+from lanpwner.protocols.bacnet import BACnetModule
+from lanpwner.protocols.modbus import ModbusModule
 
 LEGAL_DISCLAIMER = """
 This tool is for authorized security testing and educational use only.\nUnauthorized use against networks you do not own or have explicit permission to test is illegal and unethical.
@@ -694,6 +698,49 @@ def main():
     attack_parser.add_argument('--debug', action='store_true', help='Enable debug output')
     attack_parser.add_argument('--yes-i-am-authorized', action='store_true', help='Confirm you are authorized to run attacks')
 
+    # SNMP protocol
+    snmp_parser = subparsers.add_parser('snmp', help='SNMP discovery, brute-force, enumeration, and CVE checks')
+    snmp_parser.add_argument('--subnet', type=str, default='192.168.1.0/24', help='Subnet to scan')
+    snmp_parser.add_argument('--bruteforce', action='store_true', help='Brute-force community strings')
+    snmp_parser.add_argument('--enumerate', action='store_true', help='Enumerate SNMP info')
+    snmp_parser.add_argument('--ip', type=str, help='Target IP for enumeration/brute-force')
+    snmp_parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    snmp_parser.add_argument('--report', type=str, help='Save findings to a report file (HTML or JSON)')
+    snmp_parser.add_argument('--format', type=str, choices=['html', 'json'], default='html', help='Report format')
+
+    # SIP protocol
+    sip_parser = subparsers.add_parser('sip', help='SIP discovery, user enumeration, brute-force, call spoofing')
+    sip_parser.add_argument('--subnet', type=str, default='192.168.1.0/24', help='Subnet to scan')
+    sip_parser.add_argument('--enumerate-users', action='store_true', help='Enumerate SIP users/extensions')
+    sip_parser.add_argument('--bruteforce', action='store_true', help='Brute-force SIP REGISTER')
+    sip_parser.add_argument('--spoof-call', action='store_true', help='Send spoofed SIP INVITE')
+    sip_parser.add_argument('--ip', type=str, help='Target IP for enumeration/brute-force')
+    sip_parser.add_argument('--user', type=str, help='SIP user/extension')
+    sip_parser.add_argument('--passlist', type=str, help='File with passwords for brute-force')
+    sip_parser.add_argument('--from-user', type=str, help='From user for spoofed call')
+    sip_parser.add_argument('--to-user', type=str, help='To user for spoofed call')
+    sip_parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    sip_parser.add_argument('--report', type=str, help='Save findings to a report file (HTML or JSON)')
+    sip_parser.add_argument('--format', type=str, choices=['html', 'json'], default='html', help='Report format')
+
+    # BACnet protocol
+    bacnet_parser = subparsers.add_parser('bacnet', help='BACnet discovery, enumeration, CVE checks')
+    bacnet_parser.add_argument('--subnet', type=str, default='192.168.1.0/24', help='Subnet to scan')
+    bacnet_parser.add_argument('--enumerate', action='store_true', help='Enumerate BACnet device info')
+    bacnet_parser.add_argument('--ip', type=str, help='Target IP for enumeration')
+    bacnet_parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    bacnet_parser.add_argument('--report', type=str, help='Save findings to a report file (HTML or JSON)')
+    bacnet_parser.add_argument('--format', type=str, choices=['html', 'json'], default='html', help='Report format')
+
+    # Modbus protocol
+    modbus_parser = subparsers.add_parser('modbus', help='Modbus discovery, enumeration, CVE checks')
+    modbus_parser.add_argument('--subnet', type=str, default='192.168.1.0/24', help='Subnet to scan')
+    modbus_parser.add_argument('--enumerate', action='store_true', help='Enumerate Modbus device info')
+    modbus_parser.add_argument('--ip', type=str, help='Target IP for enumeration')
+    modbus_parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    modbus_parser.add_argument('--report', type=str, help='Save findings to a report file (HTML or JSON)')
+    modbus_parser.add_argument('--format', type=str, choices=['html', 'json'], default='html', help='Report format')
+
     args = parser.parse_args()
 
     if args.command == 'upnp':
@@ -833,6 +880,104 @@ def main():
         else:
             print('[!] Unknown attack type.')
             sys.exit(1)
+
+    elif args.command == 'snmp':
+        snmp = SNMPModule(debug=args.debug)
+        report = ReportGenerator()
+        if args.bruteforce and args.ip:
+            comm = snmp.brute_force_community(args.ip)
+            print(f'[*] Brute-force result for {args.ip}: {comm}')
+            report.add_discovery({'ip': args.ip, 'community': comm})
+        elif args.enumerate and args.ip:
+            comm = snmp.brute_force_community(args.ip)
+            info = snmp.enumerate(args.ip, community=comm or 'public')
+            print(f'[*] SNMP info for {args.ip}: {info}')
+            findings = snmp.check_misconfigurations({'community': comm})
+            for f in findings:
+                print(f"[!] {f['title']} (Risk: {f['severity']}) - {f['description']}")
+            report.add_discovery({'ip': args.ip, 'info': info, 'community': comm})
+            for f in findings:
+                report.add_vulnerability(f)
+        else:
+            devices = snmp.discover(subnet=args.subnet)
+            print(f'[*] Found {len(devices)} SNMP device(s).')
+            for dev in devices:
+                print(f"    - {dev['ip']}")
+                report.add_discovery(dev)
+        if args.report:
+            report.generate(format=args.format, save_path=args.report)
+            print(f'[*] Report saved to {args.report}')
+
+    elif args.command == 'sip':
+        sip = SIPModule(debug=args.debug)
+        report = ReportGenerator()
+        if args.enumerate_users and args.ip:
+            users = sip.enumerate_users(args.ip)
+            print(f'[*] Enumerated users on {args.ip}: {users}')
+            for u in users:
+                report.add_discovery({'ip': args.ip, 'user': u})
+        elif args.bruteforce and args.ip and args.user and args.passlist:
+            with open(args.passlist) as pf:
+                passlist = [p.strip() for p in pf if p.strip()]
+            pwd = sip.brute_force(args.ip, args.user, passlist)
+            print(f'[*] Brute-force result for {args.user}@{args.ip}: {pwd}')
+            report.add_discovery({'ip': args.ip, 'user': args.user, 'password': pwd})
+        elif args.spoof_call and args.ip and args.from_user and args.to_user:
+            sip.spoof_call(args.ip, args.from_user, args.to_user)
+            report.add_discovery({'ip': args.ip, 'spoofed_from': args.from_user, 'spoofed_to': args.to_user})
+        else:
+            devices = sip.discover(subnet=args.subnet)
+            print(f'[*] Found {len(devices)} SIP device(s).')
+            for dev in devices:
+                print(f"    - {dev['ip']}")
+                report.add_discovery(dev)
+        if args.report:
+            report.generate(format=args.format, save_path=args.report)
+            print(f'[*] Report saved to {args.report}')
+
+    elif args.command == 'bacnet':
+        bacnet = BACnetModule(debug=args.debug)
+        report = ReportGenerator()
+        if args.enumerate and args.ip:
+            info = bacnet.enumerate(args.ip)
+            print(f'[*] BACnet info for {args.ip}: {info}')
+            findings = bacnet.check_misconfigurations(info)
+            for f in findings:
+                print(f"[!] {f['title']} (Risk: {f['severity']}) - {f['description']}")
+            report.add_discovery({'ip': args.ip, 'info': info})
+            for f in findings:
+                report.add_vulnerability(f)
+        else:
+            devices = bacnet.discover(subnet=args.subnet)
+            print(f'[*] Found {len(devices)} BACnet device(s).')
+            for dev in devices:
+                print(f"    - {dev['ip']}")
+                report.add_discovery(dev)
+        if args.report:
+            report.generate(format=args.format, save_path=args.report)
+            print(f'[*] Report saved to {args.report}')
+
+    elif args.command == 'modbus':
+        modbus = ModbusModule(debug=args.debug)
+        report = ReportGenerator()
+        if args.enumerate and args.ip:
+            info = modbus.enumerate(args.ip)
+            print(f'[*] Modbus info for {args.ip}: {info}')
+            findings = modbus.check_misconfigurations(info)
+            for f in findings:
+                print(f"[!] {f['title']} (Risk: {f['severity']}) - {f['description']}")
+            report.add_discovery({'ip': args.ip, 'info': info})
+            for f in findings:
+                report.add_vulnerability(f)
+        else:
+            devices = modbus.discover(subnet=args.subnet)
+            print(f'[*] Found {len(devices)} Modbus device(s).')
+            for dev in devices:
+                print(f"    - {dev['ip']}")
+                report.add_discovery(dev)
+        if args.report:
+            report.generate(format=args.format, save_path=args.report)
+            print(f'[*] Report saved to {args.report}')
 
 if __name__ == "__main__":
     main() 

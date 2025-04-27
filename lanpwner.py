@@ -1,19 +1,75 @@
 import argparse
 import sys
+import importlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 from lanpwner.protocols.upnp import UPnPModule
 from lanpwner.protocols.bonjour import BonjourModule
+from lanpwner.protocols.rtsp import RTSPModule
 from lanpwner.core.reporting import ReportGenerator
 from lanpwner.cli import build_host_inventory, sniff_protocols, dhcp_starvation_attack, dhcp_spoof_attack, dhcp_inform_flood, dhcp_option_overload, dhcp_leasequery, dhcp_decline_flood, dhcp_release_flood, dhcp_relay_spoof, arp_spoof_attack, arp_request_flood, arp_reply_flood, arp_cache_poison, arp_gratuitous, arp_reactive_poison, arp_malformed_flood, arp_scan, arp_storm
-from lanpwner.protocols.rtsp import RTSPModule
-import requests
 
 LEGAL_DISCLAIMER = """
 This tool is for authorized security testing and educational use only.\nUnauthorized use against networks you do not own or have explicit permission to test is illegal and unethical.
 """
 
+def enumerate_and_report(module, devices, report, check_misconfig=True, debug=False, threads=1, progress_label=None):
+    # Multi-threaded enumeration for large device lists, with progress bar and robust error handling
+    def enum_one(dev):
+        try:
+            info = module.enumerate(dev['ip'] if isinstance(dev, dict) and 'ip' in dev else dev)
+            return (dev, info)
+        except Exception as e:
+            return (dev, {'error': str(e)})
+    results = []
+    bar = None
+    total = len(devices)
+    if threads > 1 and total > 1:
+        if tqdm:
+            bar = tqdm(total=total, desc=progress_label or 'Enumerating', unit='dev')
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futs = {executor.submit(enum_one, dev): dev for dev in devices}
+            for fut in as_completed(futs):
+                dev, info = fut.result()
+                results.append((dev, info))
+                if bar:
+                    bar.update(1)
+        if bar:
+            bar.close()
+    else:
+        if tqdm:
+            bar = tqdm(total=total, desc=progress_label or 'Enumerating', unit='dev')
+        for dev in devices:
+            results.append(enum_one(dev))
+            if bar:
+                bar.update(1)
+        if bar:
+            bar.close()
+    for dev, info in results:
+        if 'error' not in info:
+            if check_misconfig and hasattr(module, 'check_misconfigurations'):
+                findings = module.check_misconfigurations(info)
+                for finding in findings:
+                    print(f"[!] {finding['title']} on {finding.get('device','')} ({finding.get('severity','')})")
+                    print(f"    {finding['description']}")
+                for finding in findings:
+                    report.add_vulnerability(finding)
+            report.add_discovery(info)
+        else:
+            print(f"[!] Error enumerating {dev.get('ip', dev)}: {info['error']}")
+
 def main():
     print(LEGAL_DISCLAIMER)
     parser = argparse.ArgumentParser(description="LANPWNER Main Protocol Management CLI")
+    parser.add_argument('--debug', action='store_true', help='Enable debug output (global)')
+    parser.add_argument('--threads', type=int, default=4, help='Number of threads for batch/protocol scans (default: 4)')
+    parser.add_argument('--modbus-threads', type=int, help='Threads for Modbus enumeration')
+    parser.add_argument('--snmp-threads', type=int, help='Threads for SNMP enumeration')
+    parser.add_argument('--bacnet-threads', type=int, help='Threads for BACnet enumeration')
+    parser.add_argument('--sip-threads', type=int, help='Threads for SIP enumeration')
     subparsers = parser.add_subparsers(dest='protocol', required=True)
 
     # UPnP protocol
@@ -121,371 +177,286 @@ def main():
     cast_parser.add_argument('--video-url', type=str, help='Video URL to cast/hijack (YouTube, direct media, etc.)')
     cast_parser.add_argument('--target', type=str, help='Target device name or address (for hijack)')
     cast_parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    cast_parser.add_argument('--airplay-message', type=str, help='Message to inject via AirPlay (text/photo/alert)')
+    cast_parser.add_argument('--airplay-message-type', type=str, choices=['text', 'photo', 'alert'], default='text', help='Type of AirPlay message to inject')
+    cast_parser.add_argument('--airplay-tts', action='store_true', help='Inject AirPlay TTS (text-to-speech) audio')
+    cast_parser.add_argument('--airplay-bruteforce-pin', action='store_true', help='Brute-force AirPlay PIN (0000-9999)')
+    cast_parser.add_argument('--mqtt-topic', type=str, help='MQTT topic to publish/subscribe')
+    cast_parser.add_argument('--mqtt-message', type=str, help='MQTT message to publish')
+    cast_parser.add_argument('--mqtt-action', type=str, choices=['publish', 'subscribe'], help='MQTT action')
+    cast_parser.add_argument('--mqtt-userlist', type=str, help='File with MQTT usernames (one per line)')
+    cast_parser.add_argument('--mqtt-passlist', type=str, help='File with MQTT passwords (one per line)')
+    cast_parser.add_argument('--mqtt-retained', action='store_true', help='Publish MQTT message as retained')
+
+    # Modbus protocol
+    modbus_parser = subparsers.add_parser('modbus', help='Modbus/TCP discovery, enumeration, and attacks')
+    modbus_group = modbus_parser.add_mutually_exclusive_group(required=True)
+    modbus_group.add_argument('--discover', action='store_true', help='Discover Modbus devices')
+    modbus_group.add_argument('--enumerate', action='store_true', help='Enumerate Modbus device info')
+    modbus_group.add_argument('--write-single-coil', action='store_true', help='Write single coil (dangerous!)')
+    modbus_group.add_argument('--write-single-register', action='store_true', help='Write single register (dangerous!)')
+    modbus_group.add_argument('--write-multiple-coils', action='store_true', help='Write multiple coils (dangerous!)')
+    modbus_group.add_argument('--write-multiple-registers', action='store_true', help='Write multiple registers (dangerous!)')
+    modbus_group.add_argument('--shell', action='store_true', help='Simulate shell execution via register write (dangerous!)')
+    modbus_parser.add_argument('--ip', type=str, help='Target IP for enumeration/attack')
+    modbus_parser.add_argument('--address', type=int, help='Coil/Register address')
+    modbus_parser.add_argument('--value', type=int, help='Value to write (for single register/shell)')
+    modbus_parser.add_argument('--values', type=str, help='Comma-separated values for multiple writes')
+    modbus_parser.add_argument('--subnet', type=str, default='192.168.1.0/24', help='Subnet for discovery')
+    modbus_parser.add_argument('--yes-i-am-authorized', action='store_true', help='Confirm you are authorized to run attacks')
+    modbus_parser.add_argument('--debug', action='store_true', help='Enable debug output')
+
+    # BACnet protocol
+    bacnet_parser = subparsers.add_parser('bacnet', help='BACnet discovery and enumeration')
+    bacnet_group = bacnet_parser.add_mutually_exclusive_group(required=True)
+    bacnet_group.add_argument('--discover', action='store_true', help='Discover BACnet devices')
+    bacnet_group.add_argument('--enumerate', action='store_true', help='Enumerate BACnet device info')
+    bacnet_parser.add_argument('--ip', type=str, help='Target IP for enumeration')
+    bacnet_parser.add_argument('--subnet', type=str, default='192.168.1.0/24', help='Subnet for discovery')
+    bacnet_parser.add_argument('--debug', action='store_true', help='Enable debug output')
+
+    # SNMP protocol
+    snmp_parser = subparsers.add_parser('snmp', help='SNMP discovery, enumeration, and brute-force')
+    snmp_group = snmp_parser.add_mutually_exclusive_group(required=True)
+    snmp_group.add_argument('--discover', action='store_true', help='Discover SNMP devices')
+    snmp_group.add_argument('--enumerate', action='store_true', help='Enumerate SNMP device info')
+    snmp_group.add_argument('--brute-force', action='store_true', help='Brute-force SNMP community strings')
+    snmp_parser.add_argument('--ip', type=str, help='Target IP for enumeration/attack')
+    snmp_parser.add_argument('--community', type=str, default='public', help='SNMP community string')
+    snmp_parser.add_argument('--subnet', type=str, default='192.168.1.0/24', help='Subnet for discovery')
+    snmp_parser.add_argument('--debug', action='store_true', help='Enable debug output')
+
+    # SIP protocol
+    sip_parser = subparsers.add_parser('sip', help='SIP discovery, user enumeration, brute-force, and spoofing')
+    sip_group = sip_parser.add_mutually_exclusive_group(required=True)
+    sip_group.add_argument('--discover', action='store_true', help='Discover SIP devices')
+    sip_group.add_argument('--enumerate-users', action='store_true', help='Enumerate SIP users/extensions')
+    sip_group.add_argument('--brute-force', action='store_true', help='Brute-force SIP REGISTER for a user')
+    sip_group.add_argument('--spoof-call', action='store_true', help='Send a spoofed SIP INVITE')
+    sip_parser.add_argument('--ip', type=str, help='Target IP for enumeration/attack')
+    sip_parser.add_argument('--user', type=str, help='SIP user/extension')
+    sip_parser.add_argument('--passlist', type=str, help='File with passwords for brute-force')
+    sip_parser.add_argument('--from-user', type=str, help='From user for spoofing')
+    sip_parser.add_argument('--to-user', type=str, help='To user for spoofing')
+    sip_parser.add_argument('--subnet', type=str, default='192.168.1.0/24', help='Subnet for discovery')
+    sip_parser.add_argument('--debug', action='store_true', help='Enable debug output')
+
+    # Batch scan mode
+    scan_parser = subparsers.add_parser('scan', help='Scan all supported protocols (discovery/enumeration)')
+    scan_parser.add_argument('--debug', action='store_true', help='Enable debug output')
 
     args = parser.parse_args()
+    global_debug = getattr(args, 'debug', False)
+    threads = getattr(args, 'threads', 4)
+    modbus_threads = getattr(args, 'modbus_threads', None) or threads
+    snmp_threads = getattr(args, 'snmp_threads', None) or threads
+    bacnet_threads = getattr(args, 'bacnet_threads', None) or threads
+    sip_threads = getattr(args, 'sip_threads', None) or threads
 
-    if args.protocol == 'upnp':
-        upnp = UPnPModule(timeout=args.timeout, max_devices=args.max_devices, interface=args.interface, listen_extra=args.listen_extra, debug=args.debug)
-        print('[*] Discovering UPnP devices...')
-        devices = upnp.discover()
-        print(f'[*] Found {len(devices)} device(s). Enumerating...')
-        report = ReportGenerator()
-        for dev in devices:
-            info = upnp.enumerate(dev)
-            if 'error' not in info:
-                findings = upnp.check_misconfigurations(info)
-                for finding in findings:
-                    print(f"[!] {finding['title']} on {finding['device']} ({finding.get('severity','')})")
-                    print(f"    {finding['description']}")
-                report.add_discovery(info)
-                for finding in findings:
-                    report.add_vulnerability(finding)
-            else:
-                print(f"[!] Error enumerating {dev.get('location')}: {info['error']}")
-        if args.report:
-            report.generate(format=args.format, save_path=args.report)
-            print(f'[*] Report saved to {args.report}')
-
-    elif args.protocol == 'bonjour':
-        bonjour = BonjourModule(timeout=args.timeout)
-        print('[*] Discovering Bonjour/mDNS (AirPlay, Chromecast) devices...')
-        services = bonjour.discover()
-        print(f'[*] Found {len(services)} service(s).')
-        report = ReportGenerator()
-        for svc in services:
-            findings = bonjour.check_misconfigurations(svc)
-            for finding in findings:
-                print(f"[!] {finding['title']} on {finding['device']} ({finding.get('severity','')})")
-                print(f"    {finding['description']}")
-            report.add_discovery(svc)
-            for finding in findings:
-                report.add_vulnerability(finding)
-        if args.report:
-            report.generate(format=args.format, save_path=args.report)
-            print(f'[*] Report saved to {args.report}')
-
-    elif args.protocol == 'sniff':
-        detected = sniff_protocols(args.interface, timeout=args.timeout, debug=args.debug)
-        report = ReportGenerator()
-        if 'upnp' in detected:
-            print('[*] Enumerating UPnP devices...')
-            upnp = UPnPModule(interface=args.interface, debug=args.debug)
+    try:
+        if args.protocol == 'upnp':
+            upnp = UPnPModule(timeout=args.timeout, max_devices=args.max_devices, interface=args.interface, listen_extra=args.listen_extra, debug=args.debug or global_debug)
+            print('[*] Discovering UPnP devices...')
             devices = upnp.discover()
-            for dev in devices:
-                info = upnp.enumerate(dev)
-                if 'error' not in info:
-                    findings = upnp.check_misconfigurations(info)
-                    for finding in findings:
-                        print(f"[!] {finding['title']} on {finding['device']} ({finding.get('severity','')})")
-                        print(f"    {finding['description']}")
-                    report.add_discovery(info)
-                    for finding in findings:
-                        report.add_vulnerability(finding)
-        if 'bonjour' in detected:
-            print('[*] Enumerating Bonjour/mDNS (AirPlay, Chromecast) devices...')
-            bonjour = BonjourModule()
+            print(f'[*] Found {len(devices)} device(s). Enumerating...')
+            report = ReportGenerator()
+            enumerate_and_report(upnp, devices, report, debug=args.debug or global_debug, threads=threads, progress_label='UPnP')
+            if args.report:
+                report.generate(format=args.format, save_path=args.report)
+                print(f'[*] Report saved to {args.report}')
+
+        elif args.protocol == 'bonjour':
+            bonjour = BonjourModule(timeout=args.timeout)
+            print('[*] Discovering Bonjour/mDNS (AirPlay, Chromecast) devices...')
             services = bonjour.discover()
-            for svc in services:
-                findings = bonjour.check_misconfigurations(svc)
-                for finding in findings:
-                    print(f"[!] {finding['title']} on {finding['device']} ({finding.get('severity','')})")
-                    print(f"    {finding['description']}")
-                report.add_discovery(svc)
-                for finding in findings:
-                    report.add_vulnerability(finding)
-        for dev in sniff_protocols.detected_devices:
-            report.add_discovery(dev)
-        if args.report:
-            report.generate(format=args.format, save_path=args.report)
-            print(f'[*] Report saved to {args.report}')
+            print(f'[*] Found {len(services)} service(s).')
+            report = ReportGenerator()
+            enumerate_and_report(bonjour, services, report, check_misconfig=False, debug=args.debug or global_debug, threads=threads, progress_label='Bonjour')
+            if args.report:
+                report.generate(format=args.format, save_path=args.report)
+                print(f'[*] Report saved to {args.report}')
 
-    elif args.protocol == 'inventory':
-        inventory = build_host_inventory(args.interface, timeout=args.timeout, debug=args.debug)
-        report = ReportGenerator()
-        for host in inventory:
-            report.add_discovery(host)
-        if args.report:
-            report.generate(format=args.format, save_path=args.report)
-            print(f'[*] Report saved to {args.report}')
+        elif args.protocol == 'modbus':
+            from lanpwner.protocols.modbus import ModbusModule
+            modbus = ModbusModule(debug=args.debug or global_debug)
+            if args.discover:
+                devices = modbus.discover(subnet=args.subnet)
+                print(f'[*] Found {len(devices)} Modbus device(s). Enumerating...')
+                report = ReportGenerator()
+                enumerate_and_report(modbus, devices, report, debug=args.debug or global_debug, threads=modbus_threads, progress_label='Modbus')
+            elif args.enumerate:
+                if not args.ip:
+                    print('[!] --ip is required for enumeration.')
+                    sys.exit(1)
+                info = modbus.enumerate(args.ip)
+                print(f'[*] Enumeration result for {args.ip}:')
+                print(info)
+            elif args.write_single_coil:
+                if not args.yes_i_am_authorized:
+                    print('[!] You must use --yes-i-am-authorized to run this attack.')
+                    sys.exit(1)
+                if not (args.ip and args.address is not None and args.value is not None):
+                    print('[!] --ip, --address, and --value are required.')
+                    sys.exit(1)
+                result = modbus.write_single_coil(args.ip, args.address, bool(args.value))
+                print(result)
+            elif args.write_single_register:
+                if not args.yes_i_am_authorized:
+                    print('[!] You must use --yes-i-am-authorized to run this attack.')
+                    sys.exit(1)
+                if not (args.ip and args.address is not None and args.value is not None):
+                    print('[!] --ip, --address, and --value are required.')
+                    sys.exit(1)
+                result = modbus.write_single_register(args.ip, args.address, args.value)
+                print(result)
+            elif args.write_multiple_coils:
+                if not args.yes_i_am_authorized:
+                    print('[!] You must use --yes-i-am-authorized to run this attack.')
+                    sys.exit(1)
+                if not (args.ip and args.address is not None and args.values):
+                    print('[!] --ip, --address, and --values are required.')
+                    sys.exit(1)
+                values = [bool(int(v)) for v in args.values.split(',')]
+                result = modbus.write_multiple_coils(args.ip, args.address, values)
+                print(result)
+            elif args.write_multiple_registers:
+                if not args.yes_i_am_authorized:
+                    print('[!] You must use --yes-i-am-authorized to run this attack.')
+                    sys.exit(1)
+                if not (args.ip and args.address is not None and args.values):
+                    print('[!] --ip, --address, and --values are required.')
+                    sys.exit(1)
+                values = [int(v) for v in args.values.split(',')]
+                result = modbus.write_multiple_registers(args.ip, args.address, values)
+                print(result)
+            elif args.shell:
+                if not args.yes_i_am_authorized:
+                    print('[!] You must use --yes-i-am-authorized to run this attack.')
+                    sys.exit(1)
+                if not (args.ip and args.address is not None and args.value is not None):
+                    print('[!] --ip, --address, and --value are required.')
+                    sys.exit(1)
+                result = modbus.shell(args.ip, args.address, args.value)
+                print(result)
 
-    elif args.protocol == 'dhcp':
-        if args.starvation:
-            dhcp_starvation_attack(args.interface, count=args.count, debug=args.debug)
-        elif args.spoof:
-            if not (args.pool_start and args.pool_end and args.gateway and args.dns):
-                print('[!] --pool-start, --pool-end, --gateway, and --dns are required for DHCP spoof.')
-                sys.exit(1)
-            dhcp_spoof_attack(args.interface, pool_start=args.pool_start, pool_end=args.pool_end, gateway=args.gateway, dns=args.dns, lease_time=args.lease_time, debug=args.debug)
-        elif args.inform_flood:
-            dhcp_inform_flood(args.interface, count=args.count, debug=args.debug)
-        elif args.option_overload:
-            dhcp_option_overload(args.interface, count=args.count, debug=args.debug)
-        elif args.leasequery:
-            dhcp_leasequery(args.interface, debug=args.debug)
-        elif args.decline_flood:
-            dhcp_decline_flood(args.interface, count=args.count, debug=args.debug)
-        elif args.release_flood:
-            dhcp_release_flood(args.interface, count=args.count, debug=args.debug)
-        elif args.relay_spoof:
-            dhcp_relay_spoof(args.interface, count=args.count, debug=args.debug)
+        elif args.protocol == 'bacnet':
+            from lanpwner.protocols.bacnet import BACnetModule
+            bacnet = BACnetModule(debug=args.debug or global_debug)
+            if args.discover:
+                devices = bacnet.discover(subnet=args.subnet)
+                print(f'[*] Found {len(devices)} BACnet device(s). Enumerating...')
+                report = ReportGenerator()
+                enumerate_and_report(bacnet, devices, report, debug=args.debug or global_debug, threads=bacnet_threads, progress_label='BACnet')
+            elif args.enumerate:
+                if not args.ip:
+                    print('[!] --ip is required for enumeration.')
+                    sys.exit(1)
+                info = bacnet.enumerate(args.ip)
+                print(f'[*] Enumeration result for {args.ip}:')
+                print(info)
+
+        elif args.protocol == 'snmp':
+            from lanpwner.protocols.snmp import SNMPModule
+            snmp = SNMPModule(debug=args.debug or global_debug)
+            if args.discover:
+                devices = snmp.discover(subnet=args.subnet)
+                print(f'[*] Found {len(devices)} SNMP device(s). Enumerating...')
+                report = ReportGenerator()
+                enumerate_and_report(snmp, devices, report, debug=args.debug or global_debug, threads=snmp_threads, progress_label='SNMP')
+            elif args.enumerate:
+                if not args.ip:
+                    print('[!] --ip is required for enumeration.')
+                    sys.exit(1)
+                info = snmp.enumerate(args.ip, community=args.community)
+                print(f'[*] Enumeration result for {args.ip}:')
+                print(info)
+            elif args.brute_force:
+                if not args.ip:
+                    print('[!] --ip is required for brute-force.')
+                    sys.exit(1)
+                comm = snmp.brute_force_community(args.ip)
+                print(f'[*] Brute-force result for {args.ip}: {comm}')
+
+        elif args.protocol == 'sip':
+            from lanpwner.protocols.sip import SIPModule
+            sip = SIPModule(debug=args.debug or global_debug)
+            if args.discover:
+                devices = sip.discover(subnet=args.subnet)
+                print(f'[*] Found {len(devices)} SIP device(s). Enumerating...')
+                report = ReportGenerator()
+                enumerate_and_report(sip, devices, report, check_misconfig=False, debug=args.debug or global_debug, threads=sip_threads, progress_label='SIP')
+            elif args.enumerate_users:
+                if not args.ip:
+                    print('[!] --ip is required for user enumeration.')
+                    sys.exit(1)
+                users = sip.enumerate_users(args.ip)
+                print(f'[*] Users found on {args.ip}: {users}')
+            elif args.brute_force:
+                if not (args.ip and args.user and args.passlist):
+                    print('[!] --ip, --user, and --passlist are required for brute-force.')
+                    sys.exit(1)
+                with open(args.passlist) as pf:
+                    passlist = [p.strip() for p in pf if p.strip()]
+                pwd = sip.brute_force(args.ip, args.user, passlist)
+                print(f'[*] Brute-force result for {args.ip} user {args.user}: {pwd}')
+            elif args.spoof_call:
+                if not (args.ip and args.from_user and args.to_user):
+                    print('[!] --ip, --from-user, and --to-user are required for spoofing.')
+                    sys.exit(1)
+                result = sip.spoof_call(args.ip, args.from_user, args.to_user)
+                print(f'[*] Spoof call result: {result}')
+
+        elif args.protocol == 'scan':
+            # Batch scan mode: run all discovery/enumeration modules in parallel
+            print('[*] Running batch scan of all supported protocols (multi-threaded)...')
+            report = ReportGenerator()
+            scan_jobs = []
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                # UPnP
+                upnp = UPnPModule(debug=args.debug or global_debug)
+                scan_jobs.append(executor.submit(lambda: ("upnp", upnp, upnp.discover())))
+                # Bonjour
+                bonjour = BonjourModule()
+                scan_jobs.append(executor.submit(lambda: ("bonjour", bonjour, bonjour.discover())))
+                # Modbus
+                from lanpwner.protocols.modbus import ModbusModule
+                modbus = ModbusModule(debug=args.debug or global_debug)
+                scan_jobs.append(executor.submit(lambda: ("modbus", modbus, modbus.discover())))
+                # BACnet
+                from lanpwner.protocols.bacnet import BACnetModule
+                bacnet = BACnetModule(debug=args.debug or global_debug)
+                scan_jobs.append(executor.submit(lambda: ("bacnet", bacnet, bacnet.discover())))
+                # SNMP
+                from lanpwner.protocols.snmp import SNMPModule
+                snmp = SNMPModule(debug=args.debug or global_debug)
+                scan_jobs.append(executor.submit(lambda: ("snmp", snmp, snmp.discover())))
+                # SIP
+                from lanpwner.protocols.sip import SIPModule
+                sip = SIPModule(debug=args.debug or global_debug)
+                scan_jobs.append(executor.submit(lambda: ("sip", sip, sip.discover())))
+                for fut in as_completed(scan_jobs):
+                    proto, module, devices = fut.result()
+                    print(f'[*] {proto.upper()}: {len(devices)} device(s) found. Enumerating...')
+                    # Use per-protocol thread tuning
+                    proto_threads = threads
+                    if proto == 'modbus':
+                        proto_threads = modbus_threads
+                    elif proto == 'snmp':
+                        proto_threads = snmp_threads
+                    elif proto == 'bacnet':
+                        proto_threads = bacnet_threads
+                    elif proto == 'sip':
+                        proto_threads = sip_threads
+                    enumerate_and_report(module, devices, report, check_misconfig=(proto!="bonjour" and proto!="sip"), debug=args.debug or global_debug, threads=proto_threads, progress_label=proto.upper())
+            print(f'[*] Batch scan complete. {report.discovery_count()} devices found, {report.vulnerability_count()} vulnerabilities detected.')
+
         else:
-            print('[!] No DHCP attack selected.')
+            print('[!] No valid protocol selected.')
             sys.exit(1)
 
-    elif args.protocol == 'arp':
-        if args.spoof:
-            if not args.target_ip or not args.spoof_ip:
-                print('[!] --target-ip and --spoof-ip are required for ARP spoofing.')
-                sys.exit(1)
-            arp_spoof_attack(args.interface, target_ip=args.target_ip, spoof_ip=args.spoof_ip, count=args.count, debug=args.debug)
-        elif args.request_flood:
-            arp_request_flood(args.interface, count=args.count, debug=args.debug)
-        elif args.reply_flood:
-            arp_reply_flood(args.interface, count=args.count, debug=args.debug)
-        elif args.cache_poison:
-            if not args.target_ip or not args.spoof_ip:
-                print('[!] --target-ip and --spoof-ip are required for ARP cache poisoning.')
-                sys.exit(1)
-            arp_cache_poison(args.interface, target_ip=args.target_ip, spoof_ip=args.spoof_ip, spoof_mac=args.spoof_mac, count=args.count, debug=args.debug)
-        elif args.gratuitous:
-            if not args.spoof_ip:
-                print('[!] --spoof-ip is required for gratuitous ARP.')
-                sys.exit(1)
-            arp_gratuitous(args.interface, spoof_ip=args.spoof_ip, spoof_mac=args.spoof_mac, count=args.count, debug=args.debug)
-        elif args.reactive_poison:
-            if not args.spoof_ip:
-                print('[!] --spoof-ip is required for reactive ARP poisoning.')
-                sys.exit(1)
-            arp_reactive_poison(args.interface, target_ip=args.target_ip, spoof_ip=args.spoof_ip, spoof_mac=args.spoof_mac, debug=args.debug, duration=args.duration)
-        elif args.malformed_flood:
-            arp_malformed_flood(args.interface, count=args.count, debug=args.debug)
-        elif args.scan:
-            arp_scan(args.interface, subnet=args.subnet, debug=args.debug)
-        elif args.storm:
-            arp_storm(args.interface, count=args.count, debug=args.debug)
-        else:
-            print('[!] No ARP attack selected.')
-            sys.exit(1)
-
-    elif args.protocol == 'rtsp':
-        rtsp = RTSPModule()
-        if args.discover:
-            print(f'[*] Discovering RTSP endpoints (timeout: {args.timeout}s)...')
-            endpoints = rtsp.discover(timeout=args.timeout)
-            print(f'[*] Found {len(endpoints) if endpoints else 0} RTSP endpoint(s).')
-            if endpoints:
-                for ep in endpoints:
-                    print(f'    - {ep}')
-        elif args.enumerate:
-            if not args.endpoint:
-                print('[!] --endpoint is required for enumeration.')
-                sys.exit(1)
-            info = rtsp.enumerate(args.endpoint)
-            print(f'[*] Enumeration result for {args.endpoint}:')
-            print(info)
-        elif args.audit:
-            if not args.endpoint:
-                print('[!] --endpoint is required for audit.')
-                sys.exit(1)
-            result = rtsp.audit(args.endpoint, username=args.username, password=args.password)
-            print(f'[*] Audit result for {args.endpoint}:')
-            print(result)
-        elif args.options_fingerprint:
-            if not args.endpoint:
-                print('[!] --endpoint is required for OPTIONS fingerprinting.')
-                sys.exit(1)
-            result = rtsp.options_fingerprint(args.endpoint)
-            print(f'[*] OPTIONS fingerprint for {args.endpoint}:')
-            print(result)
-        elif args.describe_leak:
-            if not args.endpoint:
-                print('[!] --endpoint is required for DESCRIBE leak test.')
-                sys.exit(1)
-            result = rtsp.describe_leak(args.endpoint)
-            print(f'[*] DESCRIBE leak result for {args.endpoint}:')
-            print(result)
-        elif args.teardown_dos:
-            if not args.endpoint:
-                print('[!] --endpoint is required for TEARDOWN DoS.')
-                sys.exit(1)
-            result = rtsp.teardown_dos(args.endpoint)
-            print(f'[*] TEARDOWN DoS result for {args.endpoint}:')
-            print(result)
-        else:
-            print('[!] No RTSP action selected.')
-            sys.exit(1)
-
-    elif args.protocol == 'cast':
-        # 1. Detect all castable devices (Bonjour/mDNS and UPnP)
-        bonjour = BonjourModule(timeout=5)
-        upnp = UPnPModule(timeout=5, debug=args.debug)
-        devices = []
-        mobile_devices = []
-        if args.detect_sessions or args.hijack or args.broadcast:
-            print('[*] Enumerating Bonjour/mDNS (Chromecast, AirPlay, Mobile) devices...')
-            bonjour_services = bonjour.discover()
-            for svc in bonjour_services:
-                # Mobile device detection via Bonjour
-                name = svc.get('name','').lower()
-                props = svc.get('properties', {})
-                is_mobile = False
-                if 'iphone' in name or 'ipad' in name or 'android' in name or 'ios' in name:
-                    is_mobile = True
-                if 'model' in props and ('iphone' in props['model'].lower() or 'ipad' in props['model'].lower() or 'android' in props['model'].lower()):
-                    is_mobile = True
-                if is_mobile:
-                    mobile_devices.append({'type': 'bonjour', 'info': svc})
-                if svc.get('service_type') in ['_googlecast._tcp.local.', '_chromecast._tcp.local.', '_airplay._tcp.local.']:
-                    devices.append({'type': 'bonjour', 'info': svc})
-            print(f'[*] Enumerating UPnP/SSDP (DLNA, MediaRenderer, Smart TV, Mobile) devices...')
-            upnp_devices = upnp.discover()
-            for dev in upnp_devices:
-                info = upnp.enumerate(dev)
-                features = info.get('media_features', [])
-                # Mobile device detection via UPnP
-                vendor = (info.get('manufacturer') or '').lower()
-                model = (info.get('modelName') or '').lower()
-                if any(x in vendor for x in ['samsung', 'apple', 'huawei', 'xiaomi', 'oneplus', 'google', 'android', 'iphone', 'ipad']) or any(x in model for x in ['android', 'iphone', 'ipad']):
-                    mobile_devices.append({'type': 'upnp', 'info': info})
-                if any(f in features for f in ['MediaRenderer', 'DLNA', 'Chromecast', 'DIAL (Google Cast/Smart TV)', 'AVTransport (DLNA/UPnP AV)']):
-                    devices.append({'type': 'upnp', 'info': info})
-        if args.detect_sessions:
-            print(f'[*] Detected {len(devices)} cast-capable device(s):')
-            for d in devices:
-                session_state = None
-                if d['type'] == 'bonjour':
-                    name = d['info'].get('name')
-                    addresses = d['info'].get('addresses')
-                    ip = addresses[0] if addresses else None
-                    print(f'    - Bonjour: {name} ({addresses})')
-                    # Chromecast/Google Cast session detection
-                    if '_googlecast._tcp.local.' in d['info'].get('service_type','') or '_chromecast._tcp.local.' in d['info'].get('service_type',''):
-                        if ip:
-                            try:
-                                # Query /setup/eureka_info for status
-                                resp = requests.get(f'http://{ip}:8008/setup/eureka_info', timeout=2)
-                                if resp.ok:
-                                    data = resp.json()
-                                    app = data.get('running', None)
-                                    if app:
-                                        session_state = f'App running: {app}'
-                                    else:
-                                        session_state = 'Idle/No app running'
-                                # Query /apps for current app
-                                resp2 = requests.get(f'http://{ip}:8008/apps', timeout=2)
-                                if resp2.ok and 'YouTube' in resp2.text:
-                                    session_state = 'YouTube app active'
-                            except Exception as e:
-                                if args.debug:
-                                    print(f'[DEBUG] Chromecast session query failed: {e}')
-                    elif '_airplay._tcp.local.' in d['info'].get('service_type',''):
-                        # AirPlay: no public API for session, but can check if port 7000 is open
-                        if ip:
-                            import socket
-                            s = socket.socket()
-                            s.settimeout(1)
-                            try:
-                                s.connect((ip, 7000))
-                                session_state = 'AirPlay service reachable (port 7000 open)'
-                                s.close()
-                            except Exception:
-                                session_state = 'AirPlay service not reachable'
-                    if session_state:
-                        print(f'        [Session] {session_state}')
-                elif d['type'] == 'upnp':
-                    name = d['info'].get('friendlyName')
-                    address = d['info'].get('address')
-                    features = d['info'].get('media_features', [])
-                    print(f'    - UPnP: {name} ({address}) [{", ".join(features)}]')
-                    # DLNA/UPnP AVTransport session detection
-                    avtransport_url = None
-                    for svc in d['info'].get('services', []):
-                        if svc.get('serviceType','').lower().endswith('avtransport:1'):
-                            avtransport_url = svc.get('controlURL')
-                            break
-                    if avtransport_url and address:
-                        # Try to send GetTransportInfo SOAP request
-                        try:
-                            soap_body = '''<?xml version="1.0" encoding="utf-8"?>
-                                <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-                                  <s:Body>
-                                    <u:GetTransportInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
-                                      <InstanceID>0</InstanceID>
-                                    </u:GetTransportInfo>
-                                  </s:Body>
-                                </s:Envelope>'''
-                            headers = {
-                                'Content-Type': 'text/xml; charset="utf-8"',
-                                'SOAPACTION': '"urn:schemas-upnp-org:service:AVTransport:1#GetTransportInfo"'
-                            }
-                            url = avtransport_url
-                            if not url.startswith('http'):
-                                url = f'http://{address}{url}'
-                            resp = requests.post(url, data=soap_body, headers=headers, timeout=2)
-                            if resp.ok and 'CurrentTransportState' in resp.text:
-                                if 'PLAYING' in resp.text:
-                                    session_state = 'Media playing'
-                                elif 'PAUSED' in resp.text:
-                                    session_state = 'Media paused'
-                                elif 'STOPPED' in resp.text:
-                                    session_state = 'Stopped'
-                                else:
-                                    session_state = 'Unknown state'
-                        except Exception as e:
-                            if args.debug:
-                                print(f'[DEBUG] UPnP AVTransport session query failed: {e}')
-                    if session_state:
-                        print(f'        [Session] {session_state}')
-            if mobile_devices:
-                print(f'[*] Detected {len(mobile_devices)} mobile device(s) (Android/iOS):')
-                for m in mobile_devices:
-                    if m['type'] == 'bonjour':
-                        name = m['info'].get('name')
-                        addresses = m['info'].get('addresses')
-                        print(f'    - Bonjour Mobile: {name} ({addresses})')
-                    elif m['type'] == 'upnp':
-                        name = m['info'].get('friendlyName')
-                        address = m['info'].get('address')
-                        print(f'    - UPnP Mobile: {name} ({address})')
-                print('[*] (Mobile device takeover is a stub. See below for possible methods.)')
-            print('[*] (Session state detection is now protocol-specific. See above for details.)')
-        elif args.hijack:
-            print('[*] Hijack mode selected.')
-            print('[*] (Hijack logic is a stub. Would send cast/play command to the target device.)')
-            print(f'    Target: {args.target}, Video: {args.video_url}')
-            if mobile_devices:
-                print(f'[*] {len(mobile_devices)} mobile device(s) detected. Attempting takeover (stub):')
-                for m in mobile_devices:
-                    if m['type'] == 'bonjour':
-                        name = m['info'].get('name')
-                        print(f'    - Would attempt AirPlay/Bonjour takeover: {name}')
-                    elif m['type'] == 'upnp':
-                        name = m['info'].get('friendlyName')
-                        print(f'    - Would attempt UPnP/DIAL takeover: {name}')
-                print('[*] (Mobile device takeover logic is a stub. Would attempt to send media/cast command if supported.)')
-        elif args.broadcast:
-            print('[*] Broadcast mode selected.')
-            print(f'[*] Attempting to broadcast {args.video_url} to all detected TVs/media servers...')
-            for d in devices:
-                if d['type'] == 'bonjour':
-                    name = d['info'].get('name')
-                    print(f'    - Would cast to Bonjour device: {name}')
-                elif d['type'] == 'upnp':
-                    name = d['info'].get('friendlyName')
-                    print(f'    - Would cast to UPnP device: {name}')
-            if mobile_devices:
-                print(f'[*] Attempting to broadcast to {len(mobile_devices)} mobile device(s) (stub):')
-                for m in mobile_devices:
-                    if m['type'] == 'bonjour':
-                        name = m['info'].get('name')
-                        print(f'    - Would attempt AirPlay/Bonjour broadcast: {name}')
-                    elif m['type'] == 'upnp':
-                        name = m['info'].get('friendlyName')
-                        print(f'    - Would attempt UPnP/DIAL broadcast: {name}')
-                print('[*] (Mobile device broadcast logic is a stub. Would attempt to send media/cast command if supported.)')
-        else:
-            print('[!] No cast action selected.')
-            sys.exit(1)
+    except Exception as e:
+        print(f'[!] Fatal error: {e}')
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
