@@ -176,7 +176,7 @@ def main():
     cast_group.add_argument('--detect-sessions', action='store_true', help='Detect ongoing casting sessions on the LAN')
     cast_group.add_argument('--hijack', action='store_true', help='Hijack a detected casting session')
     cast_group.add_argument('--broadcast', action='store_true', help='Broadcast a video to all TVs/media servers')
-    cast_parser.add_argument('--video-url', type=str, help='Video URL to cast/hijack (YouTube, direct media, etc.)')
+    cast_parser.add_argument('--video-url', type=str, help='Video URL to cast/hijack (YouTube, direct media, etc.). If not provided, defaults to Never Gonna Give You Up')
     cast_parser.add_argument('--target', type=str, help='Target device name or address (for hijack)')
     cast_parser.add_argument('--debug', action='store_true', help='Enable debug output')
     cast_parser.add_argument('--airplay-message', type=str, help='Message to inject via AirPlay (text/photo/alert)')
@@ -454,55 +454,57 @@ def main():
 
         elif args.protocol == 'cast':
             cast = CastModule(debug=args.debug)
-            loop = asyncio.get_event_loop()
+            
+            async def run_cast_operations():
+                # Discover devices first
+                print("[*] Discovering cast-capable devices...")
+                devices = await cast.discover_devices()
+                print(f"[*] Found {len(devices)} device(s)")
 
-            # Discover devices first
-            print("[*] Discovering cast-capable devices...")
-            devices = loop.run_until_complete(cast.discover_devices())
-            print(f"[*] Found {len(devices)} device(s)")
+                if args.detect_sessions:
+                    print("[*] Detecting active casting sessions...")
+                    sessions = await cast.detect_sessions()
+                    if sessions:
+                        print(f"[*] Found {len(sessions)} active session(s):")
+                        for session in sessions:
+                            print(f"\nDevice: {session['device_name']} ({session['device_type']})")
+                            print(f"Status: {session['status']}")
+                            print(f"App: {session['app']}")
+                            print(f"Media Type: {session['media_type']}")
+                            print(f"Progress: {session['current_time']}/{session['duration']} seconds")
+                            print(f"Volume: {session['volume']}")
+                    else:
+                        print("[*] No active casting sessions found")
 
-            if args.detect_sessions:
-                print("[*] Detecting active casting sessions...")
-                sessions = loop.run_until_complete(cast.detect_sessions())
-                if sessions:
-                    print(f"[*] Found {len(sessions)} active session(s):")
-                    for session in sessions:
-                        print(f"\nDevice: {session['device_name']} ({session['device_type']})")
-                        print(f"Status: {session['status']}")
-                        print(f"App: {session['app']}")
-                        print(f"Media Type: {session['media_type']}")
-                        print(f"Progress: {session['current_time']}/{session['duration']} seconds")
-                        print(f"Volume: {session['volume']}")
-                else:
-                    print("[*] No active casting sessions found")
+                elif args.hijack:
+                    if not args.target:
+                        print("[!] Error: --target is required for hijack")
+                        sys.exit(1)
 
-            elif args.hijack:
-                if not args.target:
-                    print("[!] Error: --target is required for hijack")
-                    sys.exit(1)
-                if not args.video_url:
-                    print("[!] Error: --video-url is required for hijack")
-                    sys.exit(1)
+                    print(f"[*] Attempting to hijack session on {args.target}...")
+                    if not args.video_url:
+                        print("[*] No video URL provided, using Rick Astley - Never Gonna Give You Up")
+                    success = await cast.hijack_session(args.target, args.video_url)
+                    if not success:
+                        print("[!] Failed to hijack session")
+                        sys.exit(1)
 
-                print(f"[*] Attempting to hijack session on {args.target}...")
-                success = loop.run_until_complete(cast.hijack_session(args.target, args.video_url))
-                if not success:
-                    print("[!] Failed to hijack session")
-                    sys.exit(1)
+                elif args.broadcast:
+                    print("[*] Broadcasting video to all discovered devices...")
+                    if not args.video_url:
+                        print("[*] No video URL provided, using Rick Astley - Never Gonna Give You Up")
+                    results = await cast.broadcast_to_all(args.video_url)
+                    print("\nBroadcast Results:")
+                    for result in results:
+                        status = "✓" if result['status'] == 'success' else "✗"
+                        print(f"{status} {result['device']} ({result['type']})")
+                        if result['status'] == 'failed':
+                            print(f"   Error: {result['error']}")
 
-            elif args.broadcast:
-                if not args.video_url:
-                    print("[!] Error: --video-url is required for broadcast")
-                    sys.exit(1)
-
-                print("[*] Broadcasting video to all discovered devices...")
-                results = loop.run_until_complete(cast.broadcast_to_all(args.video_url))
-                print("\nBroadcast Results:")
-                for result in results:
-                    status = "✓" if result['status'] == 'success' else "✗"
-                    print(f"{status} {result['device']} ({result['type']})")
-                    if result['status'] == 'failed':
-                        print(f"   Error: {result['error']}")
+            # Run the async operations with proper event loop handling
+            if sys.platform == 'win32':
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            asyncio.run(run_cast_operations())
 
         else:
             print('[!] No valid protocol selected.')
