@@ -1,9 +1,12 @@
 # Install all dependencies with: pip install -r requirements.txt
-scapy
-netifaces
-zeroconf
-requests
+requests>=2.31.0
+scapy>=2.5.0
+zeroconf>=0.131.0
+netifaces>=0.11.0
+tqdm>=4.66.1
+pychromecast>=13.1.0
+pyatv>=0.14.3
+asyncio>=3.4.3
 lxml
 pyyaml
-asyncio
 colorama 

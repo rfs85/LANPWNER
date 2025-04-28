@@ -70,32 +70,42 @@ class BonjourModule:
         return findings
 
 class _BonjourListener(ServiceListener):
-    _results: List[Dict[str, Any]] = []
+    _results = []
 
-    def __init__(self, service_type):
+    def __init__(self, service_type: str):
         self.service_type = service_type
 
-    def remove_service(self, zeroconf, type, name):
-        pass
+    @classmethod
+    def collected_results(cls) -> List[Dict[str, Any]]:
+        return cls._results
 
-    def add_service(self, zeroconf, type, name):
-        info = zeroconf.get_service_info(type, name)
+    def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        info = zc.get_service_info(type_, name)
         if info:
-            addresses = [socket.inet_ntoa(addr) for addr in info.addresses] if info.addresses else []
-            properties = {k.decode(): v.decode(errors='ignore') for k, v in (info.properties or {}).items()}
-            _BonjourListener._results.append({
-                'name': info.name,
-                'service_type': type,
-                'addresses': addresses,
+            # Safely handle properties that might be None
+            properties = {}
+            if info.properties:
+                for k, v in info.properties.items():
+                    if k is not None and v is not None:
+                        try:
+                            key = k.decode() if isinstance(k, bytes) else str(k)
+                            value = v.decode(errors='ignore') if isinstance(v, bytes) else str(v)
+                            properties[key] = value
+                        except Exception:
+                            continue
+
+            service = {
+                'name': name.replace(f'.{type_}', ''),
+                'service_type': type_,
+                'server': info.server,
+                'address': socket.inet_ntoa(info.addresses[0]) if info.addresses else None,
                 'port': info.port,
                 'properties': properties
-            })
+            }
+            self._results.append(service)
 
-    def update_service(self, zeroconf, type, name):
+    def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
         pass
 
-    @classmethod
-    def collected_results(cls):
-        results = cls._results.copy()
-        cls._results.clear()
-        return results 
+    def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        pass 

